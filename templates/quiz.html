@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>M05 Exam Question Practice - Quiz</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>M05 Exam Question Practice</h1>
+            <div class="header-actions">
+                <a href="/history" class="btn-secondary" style="text-decoration: none; margin-right: 10px;">History</a>
+                <a href="/logout" class="btn-secondary" style="text-decoration: none; margin-right: 10px;">Logout</a>
+                <button id="exitBtn" class="btn-secondary">Exit Quiz</button>
+                <div class="stats">
+                    <span id="scoreDisplay">Score: <span id="score">0</span>/<span id="total">0</span></span>
+                </div>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <div class="question-panel">
+                <div id="loading" class="loading">Loading questions...</div>
+                
+                <div id="questionContainer" class="question-container hidden">
+                    <div class="question-header">
+                        <span class="question-number">Question <span id="currentQuestionNum">1</span> of <span id="totalQuestions">0</span></span>
+                        <div class="progress-bar">
+                            <div id="progressFill" class="progress-fill"></div>
+                        </div>
+                    </div>
+
+                    <div class="question-text" id="questionText"></div>
+
+                    <div class="options-container" id="optionsContainer"></div>
+
+                    <div class="action-buttons">
+                        <button id="prevBtn" class="btn-secondary hidden">Previous</button>
+                        <button id="submitBtn" class="btn-primary" disabled>Submit Answer</button>
+                        <button id="nextBtn" class="btn-primary hidden">Next Question</button>
+                        <button id="finishBtn" class="btn-primary hidden">Finish Quiz</button>
+                    </div>
+                </div>
+
+                <div id="noQuestions" class="no-questions hidden">
+                    <h2>No questions found</h2>
+                    <p>Please go back and select a quiz mode.</p>
+                </div>
+            </div>
+
+            <div class="feedback-panel" id="feedbackPanel">
+                <h2>Feedback</h2>
+                <div id="feedbackContent" class="feedback-content">
+                    <p class="placeholder">Submit an answer to see feedback</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='quiz.js') }}"></script>
+</body>
+</html>
+

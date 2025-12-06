@@ -1,0 +1,24 @@
+This file shows the format for question explanations.
+
+You can create a text file with any name that contains "explanation", "answer", or "concept" in the filename
+and place it in the study_text/ directory.
+
+The app supports multiple formats:
+
+FORMAT 1:
+Question: What is the definition of insurance?
+Answer: A
+Explanation: Insurance is a contract where one party agrees to indemnify another against specified losses in exchange for a premium.
+
+FORMAT 2:
+Q1: What is the definition of insurance?
+A: A
+E: Insurance is a contract where one party agrees to indemnify another against specified losses in exchange for a premium.
+
+FORMAT 3:
+What is the definition of insurance?
+Answer: A
+Explanation: Insurance is a contract where one party agrees to indemnify another against specified losses in exchange for a premium.
+
+You can mix formats in the same file. The app will automatically match questions by their text content.
+

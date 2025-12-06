@@ -1,0 +1,1293 @@
+from flask import Flask, render_template, jsonify, request, session, redirect, url_for
+from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+import os
+import json
+import re
+import secrets
+from pathlib import Path
+from functools import wraps
+try:
+    from pypdf import PdfReader
+except ImportError:
+    import PyPDF2
+    PdfReader = PyPDF2.PdfReader
+from docx import Document
+
+app = Flask(__name__)
+CORS(app)
+
+# Set secret key for sessions (use environment variable or generate one)
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+
+# Default credentials (should be changed via environment variables in production)
+DEFAULT_USERNAME = os.environ.get('APP_USERNAME', 'aaron')
+# Use pbkdf2:sha256 method for compatibility
+_default_password = os.environ.get('APP_PASSWORD', 'm05pass2025')
+DEFAULT_PASSWORD_HASH = os.environ.get('APP_PASSWORD_HASH', generate_password_hash(_default_password, method='pbkdf2:sha256'))
+
+# Directories
+EXAM_PAPERS_DIR = Path("exam_papers")
+STUDY_TEXT_DIR = Path("study_text")
+QUESTIONS_FILE = Path("questions.json")
+
+class QuestionParser:
+    """Parse questions from exam papers"""
+    
+    @staticmethod
+    def extract_text_from_pdf(pdf_path):
+        """Extract text from PDF file"""
+        text = ""
+        try:
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PdfReader(file)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+        except Exception as e:
+            print(f"Error reading PDF {pdf_path}: {e}")
+        return text
+    
+    @staticmethod
+    def extract_text_from_docx(docx_path):
+        """Extract text from DOCX file"""
+        text = ""
+        try:
+            doc = Document(docx_path)
+            for para in doc.paragraphs:
+                text += para.text + "\n"
+        except Exception as e:
+            print(f"Error reading DOCX {docx_path}: {e}")
+        return text
+    
+    @staticmethod
+    def parse_questions(text):
+        """Parse multiple choice questions from text"""
+        questions = []
+        
+        # Pattern to match questions starting with numbers (1., 2., etc.)
+        # Format: "1. Question text\nA. Option A\nB. Option B\nC. Option C\nD. Option D"
+        # Split text by question numbers
+        question_blocks = re.split(r'(?=\n\d+[\.\)]\s)', text)
+        
+        for block in question_blocks:
+            # Match question number and content
+            match = re.match(r'(\d+)[\.\)]\s*(.+?)(?=\n\d+[\.\)]|$)', block.strip(), re.DOTALL)
+            if not match:
+                continue
+                
+            question_num = match.group(1)
+            question_content = match.group(2).strip()
+            
+            # Extract options - look for lines starting with A., B., C., D., E.
+            # Options may span multiple lines, so we need to capture until the next option or question
+            options = []
+            lines = question_content.split('\n')
+            current_option = None
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Check if this line starts a new option
+                option_match = re.match(r'^([A-E])[\.\)]\s*(.+)$', line, re.IGNORECASE)
+                if option_match:
+                    # Save previous option if exists
+                    if current_option and current_option['text']:
+                        options.append(current_option)
+                    
+                    # Start new option
+                    option_letter = option_match.group(1).upper()
+                    option_text = option_match.group(2).strip()
+                    current_option = {
+                        'letter': option_letter,
+                        'text': option_text
+                    }
+                elif current_option:
+                    # Continue current option (multi-line option text)
+                    # Only append if line doesn't look like a new question or option
+                    # Also skip common PDF artifacts (headers, footers, page numbers)
+                    if (not re.match(r'^\d+[\.\)]', line) and 
+                        not re.match(r'^[A-E][\.\)]', line) and
+                        not re.search(r'Examination\s+Guide\s+E\d+', line, re.IGNORECASE) and
+                        not re.search(r'\d{4}/\d{4}\s+\d+$', line) and
+                        not re.search(r'^Page\s+\d+', line, re.IGNORECASE) and
+                        len(line.strip()) > 0):
+                        current_option['text'] += ' ' + line
+            
+            # Don't forget the last option
+            if current_option and current_option['text']:
+                options.append(current_option)
+            
+            # Clean up option text
+            for opt in options:
+                opt['text'] = re.sub(r'\s+', ' ', opt['text']).strip()
+                # Remove common PDF artifacts (page numbers, headers, footers)
+                # Remove patterns like "Examination Guide E05 Examination Guide 2025/2026 13"
+                opt['text'] = re.sub(r'\s*Examination\s+Guide\s+E\d+.*?$', '', opt['text'], flags=re.IGNORECASE)
+                opt['text'] = re.sub(r'\s*Examination\s+Guide.*?$', '', opt['text'], flags=re.IGNORECASE)
+                opt['text'] = re.sub(r'\s*\d{4}/\d{4}\s+\d+.*?$', '', opt['text'])  # Remove "2025/2026 13" patterns
+                opt['text'] = re.sub(r'\s*Page\s+\d+.*?$', '', opt['text'], flags=re.IGNORECASE)
+                # Remove trailing standalone numbers that are likely page numbers
+                opt['text'] = re.sub(r'\s+\d{1,3}\s*$', '', opt['text'])  # Remove trailing numbers (1-3 digits)
+                # Remove common footer/header patterns
+                opt['text'] = re.sub(r'^\d+/\d+\s*', '', opt['text'])  # Remove page numbers like "1/15"
+                # Remove any remaining "Examination Guide" text
+                opt['text'] = re.sub(r'\s*Examination\s+Guide.*', '', opt['text'], flags=re.IGNORECASE)
+                opt['text'] = re.sub(r'\s+', ' ', opt['text']).strip()
+                # Remove trailing punctuation that might be artifacts
+                opt['text'] = re.sub(r'[\.\s]+$', '', opt['text']).strip()
+            
+            # Extract question text (everything before the first option)
+            clean_question = question_content
+            if options:
+                # Find where first option starts
+                first_option_pattern = rf'^{re.escape(options[0]["letter"])}[\.\)]'
+                first_option_match = re.search(first_option_pattern, question_content, re.MULTILINE | re.IGNORECASE)
+                if first_option_match:
+                    clean_question = question_content[:first_option_match.start()].strip()
+            
+            # Clean up question text
+            clean_question = re.sub(r'\s+', ' ', clean_question).strip()
+            
+            # Format formulas more clearly - detect common insurance formula patterns
+            # Pattern: "Sum insured x amount of loss / Value at risk" or similar
+            formula_patterns = [
+                (r'Sum insured at the time of loss x amount of loss\s+Value at risk at the time of loss\s+Which',
+                 r'Sum insured at the time of loss × amount of loss\n────────────────────────────────────\nValue at risk at the time of loss\n\nWhich'),
+                (r'Sum insured.*?x.*?amount of loss\s+Value at risk.*?Which',
+                 r'Sum insured at the time of loss × amount of loss\n────────────────────────────────────\nValue at risk at the time of loss\n\nWhich'),
+            ]
+            
+            for pattern, replacement in formula_patterns:
+                if re.search(pattern, clean_question, re.IGNORECASE):
+                    clean_question = re.sub(pattern, replacement, clean_question, flags=re.IGNORECASE)
+                    break
+            
+            # Try to find correct answer in answer key section (look for answer patterns)
+            correct_answer = None
+            # Look for answer patterns like "1. C" or "1 C" or "Answer: 1. C"
+            answer_patterns = [
+                rf'(?:^|\n){re.escape(question_num)}[\.\)\s]*[:\s]*([A-E])(?:\s|$)',
+                rf'Question\s+{re.escape(question_num)}[:\s]+([A-E])',
+            ]
+            for pattern in answer_patterns:
+                answer_match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+                if answer_match:
+                    correct_answer = answer_match.group(1).upper()
+                    break
+            
+            # Only add if we have a valid question with at least 2 options
+            if clean_question and len(options) >= 2 and len(clean_question) > 10:
+                questions.append({
+                    'id': None,  # Will be assigned in load_questions_from_files
+                    'question': clean_question,
+                    'options': options,
+                    'correct_answer': correct_answer or options[0]['letter'],  # Default to first if not found
+                    'is_multiple_choice': False,  # Will be set later based on answer key
+                    'explanation': '',
+                    'source_file': 'exam_paper',
+                    'question_number': question_num
+                })
+        
+        return questions
+    
+    @staticmethod
+    def extract_answer_key(text):
+        """Extract answer key and learning objectives from text (look for 'Specimen Examination Answers' section)"""
+        answer_key = {}
+        learning_objectives = {}
+        
+        # Look for answer key section - try multiple patterns
+        answer_section_patterns = [
+            r'Specimen Examination Answers.*?(?=\n\n\n|\Z)',
+            r'ANSWERS?.*?(?=\n\n\n|\Z)',
+            r'Answer\s+Key.*?(?=\n\n\n|\Z)',
+            r'ANSWERS?\s+AND\s+LEARNING\s+OUTCOMES.*?(?=\n\n\n|\Z)',
+        ]
+        
+        answer_text = None
+        for pattern in answer_section_patterns:
+            answer_section = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+            if answer_section:
+                answer_text = answer_section.group(0)
+                break
+        
+        if answer_text:
+            # Pattern 1: "1 C 1.4" or "41 A,B,C 1.2" - captures question num, answer, and learning objective
+            answer_pattern1 = r'(\d+)\s+([A-E](?:,\s*[A-E])*)\s+(\d+\.\d+)'
+            matches = re.finditer(answer_pattern1, answer_text)
+            
+            for match in matches:
+                q_num = match.group(1)
+                answer = match.group(2).strip().upper()
+                learning_obj = match.group(3).strip()
+                
+                # Store full answer (may contain multiple answers like "A,B,C")
+                answer_key[q_num] = answer
+                
+                # Store learning objective (extract main number, e.g., "1.4" -> "1")
+                learning_obj_main = learning_obj.split('.')[0]
+                learning_objectives[q_num] = learning_obj_main
+            
+            # Pattern 2: If pattern 1 didn't find many, try simpler pattern "1 C" or "1. C"
+            if len(answer_key) < 10:
+                answer_pattern2 = r'(?:^|\n)(\d+)[\.\)]?\s+([A-E](?:,\s*[A-E])*)(?:\s+(\d+\.\d+))?(?=\s|$|\n)'
+                matches2 = re.finditer(answer_pattern2, answer_text, re.MULTILINE)
+                for match in matches2:
+                    q_num = match.group(1)
+                    answer = match.group(2).strip().upper()
+                    learning_obj = match.group(3) if match.group(3) else None
+                    
+                    # Only add if not already found (pattern 1 takes precedence)
+                    if q_num not in answer_key:
+                        answer_key[q_num] = answer
+                        if learning_obj:
+                            learning_obj_main = learning_obj.split('.')[0]
+                            learning_objectives[q_num] = learning_obj_main
+        
+        return answer_key, learning_objectives
+    
+    @staticmethod
+    def load_questions_from_files():
+        """Load and parse questions from all exam papers"""
+        all_questions = []
+        global_id_counter = 1  # Global counter to ensure unique IDs across all papers
+        
+        if not EXAM_PAPERS_DIR.exists():
+            EXAM_PAPERS_DIR.mkdir()
+            return all_questions
+        
+        for file_path in sorted(EXAM_PAPERS_DIR.iterdir()):  # Sort for consistent ordering
+            if file_path.suffix.lower() == '.pdf':
+                text = QuestionParser.extract_text_from_pdf(file_path)
+            elif file_path.suffix.lower() == '.docx':
+                text = QuestionParser.extract_text_from_docx(file_path)
+            elif file_path.suffix.lower() == '.txt':
+                text = file_path.read_text(encoding='utf-8')
+            else:
+                continue
+            
+            # Extract answer key and learning objectives
+            answer_key, learning_objectives = QuestionParser.extract_answer_key(text)
+            
+            # Parse questions
+            questions = QuestionParser.parse_questions(text)
+            
+            # Match answers to questions and preserve order
+            # Use explanations file as source of truth (highest priority), then PDF answer key
+            global_explanations = QuestionExplanations()
+            
+            for question in questions:
+                q_num = question.get('question_number', '')
+                q_text = question['question'].strip()
+                
+                # Highest priority: answer from explanations file (user's source of truth)
+                # Use fuzzy matching to handle slight text differences
+                exp_answer = global_explanations.get_answer(q_text)
+                if exp_answer:
+                    question['correct_answer'] = exp_answer
+                    # Check if it's multiple choice based on comma in answer
+                    question['is_multiple_choice'] = ',' in exp_answer
+                # Second priority: answer from answer key in PDF
+                elif q_num in answer_key:
+                    question['correct_answer'] = answer_key[q_num].upper()
+                    # Check if it's multiple choice based on comma in answer
+                    question['is_multiple_choice'] = ',' in answer_key[q_num]
+                
+                # Ensure we have a valid answer (fallback to first option if nothing found)
+                if not question.get('correct_answer') or question['correct_answer'] == question['options'][0]['letter']:
+                    # Only use first option as fallback if we truly have no answer
+                    # This will be flagged for manual review
+                    pass
+                
+                if q_num in learning_objectives:
+                    question['learning_objective'] = learning_objectives[q_num]
+                question['source_file'] = file_path.name
+                # Store original question number for sorting
+                question['original_order'] = int(q_num) if q_num.isdigit() else 999999
+                # Assign unique global ID
+                question['id'] = global_id_counter
+                global_id_counter += 1
+            
+            all_questions.extend(questions)
+        
+        return all_questions
+
+class QuestionExplanations:
+    """Load and match pre-written explanations for questions"""
+    
+    def __init__(self):
+        self.explanations = {}  # Maps question text (normalized) to explanation
+        self.load_explanations()
+    
+    def normalize_text(self, text):
+        """Normalize text for matching (lowercase, remove extra spaces, normalize dashes)"""
+        if not text:
+            return ""
+        # Remove extra whitespace, lowercase, remove punctuation for matching
+        normalized = re.sub(r'\s+', ' ', text.lower().strip())
+        # Normalize different dash/hyphen types to standard hyphen
+        normalized = normalized.replace('‐', '-').replace('–', '-').replace('—', '-')
+        return normalized
+    
+    def load_explanations(self):
+        """Load explanations from text file in study_text directory"""
+        if not STUDY_TEXT_DIR.exists():
+            return
+        
+        # Look for explanation files (could be .txt, .md, etc.)
+        explanation_files = []
+        for file_path in STUDY_TEXT_DIR.iterdir():
+            if file_path.suffix.lower() in ['.txt', '.md']:
+                # Check if filename suggests it's an explanations file
+                filename_lower = file_path.name.lower()
+                if 'explanation' in filename_lower or 'answer' in filename_lower or 'concept' in filename_lower:
+                    explanation_files.append(file_path)
+        
+        for file_path in explanation_files:
+            try:
+                text = file_path.read_text(encoding='utf-8')
+                self.parse_explanations(text)
+            except Exception as e:
+                print(f"Error loading explanations from {file_path}: {e}")
+    
+    def parse_explanations(self, text):
+        """Parse explanations from text file
+        
+        Supports multiple formats:
+        1. Question [number] [Learning Outcome X.X]
+           [question text]
+           A. [option]
+           B. [option]
+           Answer: [answer]
+           Explanation: [explanation]
+        
+        2. Question: [question text]
+           Answer: [answer]
+           Explanation: [explanation]
+        
+        3. Q[number]: [question text]
+           A: [answer]
+           E: [explanation]
+        
+        4. [question text]
+           Answer: [answer]
+           Explanation: [explanation]
+        """
+        # Split by question markers (Question X, QX, or separator lines)
+        # Look for patterns like "Question X" or "Q X" or separator lines
+        sections = re.split(r'\n-{3,}|\n={3,}|(?=\nQuestion\s+\d+)', text, flags=re.MULTILINE)
+        
+        for section in sections:
+            if not section.strip():
+                continue
+            
+            # Pattern 1: "Question X [Learning Outcome X.X]" format
+            question_header_match = re.search(r'Question\s+(\d+)\s*\[.*?\]\s*\n(.+?)(?=\nAnswer:|\n[A-D]\.|$)', section, re.DOTALL | re.IGNORECASE)
+            if question_header_match:
+                question_text = question_header_match.group(2).strip()
+                # Remove options (lines starting with A., B., C., D.)
+                question_text = re.sub(r'^\s*[A-D]\.\s*.+$', '', question_text, flags=re.MULTILINE)
+                question_text = re.sub(r'\s+', ' ', question_text).strip()
+            else:
+                # Pattern 2: "Question: ..." or just question text
+                question_match = re.search(r'(?:Question\s*\d*:|Q\d*:)\s*(.+?)(?:\n|Answer:|$)', section, re.DOTALL | re.IGNORECASE)
+                if not question_match:
+                    # Pattern 3: Question text at start (before options)
+                    # Find text before first option (A., B., C., D.)
+                    question_match = re.search(r'^(.+?)(?=\n\s*[A-D]\.|\n\s*Answer:)', section, re.DOTALL | re.IGNORECASE)
+                    if question_match:
+                        question_text = question_match.group(1).strip()
+                        # Remove "Question X" prefix if present
+                        question_text = re.sub(r'^Question\s+\d+.*?\n', '', question_text, flags=re.IGNORECASE)
+                        question_text = re.sub(r'\[.*?\]', '', question_text)  # Remove [Learning Outcome X.X]
+                        question_text = re.sub(r'\s+', ' ', question_text).strip()
+                    else:
+                        continue
+                else:
+                    question_text = question_match.group(1).strip()
+                    # Clean up question text
+                    question_text = re.sub(r'^\d+[\.\)]\s*', '', question_text)  # Remove leading numbers
+                    question_text = re.sub(r'\[.*?\]', '', question_text)  # Remove [Learning Outcome X.X]
+                    question_text = re.sub(r'\s+', ' ', question_text).strip()
+            
+            # Extract answer
+            answer_match = re.search(r'Answer:\s*([A-E](?:,\s*[A-E])*)', section, re.IGNORECASE)
+            answer = answer_match.group(1).strip() if answer_match else ""
+            
+            # Extract explanation
+            explanation_match = re.search(r'Explanation:\s*(.+?)(?=\n\s*(?:Question|Q\d*:|--|==|$|\Z))', section, re.DOTALL | re.IGNORECASE)
+            explanation = explanation_match.group(1).strip() if explanation_match else ""
+            
+            if question_text and explanation:
+                # Store by normalized question text
+                normalized_q = self.normalize_text(question_text)
+                self.explanations[normalized_q] = {
+                    'explanation': explanation,
+                    'answer': answer
+                }
+    
+    def get_explanation(self, question_text):
+        """Get pre-written explanation for a question if available"""
+        normalized_q = self.normalize_text(question_text)
+        
+        # Try exact match first
+        if normalized_q in self.explanations:
+            return self.explanations[normalized_q]['explanation']
+        
+        # Try fuzzy matching with improved logic
+        # Extract key unique words (longer words, numbers, specific terms)
+        question_words = normalized_q.split()
+        # Focus on distinctive words (4+ chars, not common words)
+        common_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'has', 'have', 'had', 
+                       'this', 'that', 'these', 'those', 'what', 'which', 'who', 'when', 'where', 'how',
+                       'and', 'or', 'but', 'if', 'of', 'to', 'for', 'with', 'from', 'by', 'in', 'on', 'at'}
+        key_words = [w for w in question_words if len(w) >= 4 and w not in common_words]
+        # Also include numbers and currency symbols
+        key_words.extend([w for w in question_words if re.search(r'[£\d]', w)])
+        
+        best_match = None
+        best_score = 0
+        
+        for stored_q, data in self.explanations.items():
+            stored_words = set(stored_q.split())
+            question_words_set = set(normalized_q.split())
+            
+            # Calculate overlap of key distinctive words
+            stored_key_words = [w for w in stored_q.split() if len(w) >= 4 and w not in common_words]
+            stored_key_words.extend([w for w in stored_q.split() if re.search(r'[£\d]', w)])
+            
+            key_overlap = len(set(key_words) & set(stored_key_words))
+            total_overlap = len(stored_words & question_words_set)
+            
+            # Require high similarity for key words (at least 50% of key words match)
+            # OR very high overall similarity (80%+)
+            similarity = total_overlap / max(len(stored_words), len(question_words_set), 1)
+            key_similarity = key_overlap / max(len(key_words), len(stored_key_words), 1) if key_words else 0
+            
+            # Stricter matching: require either high key word match OR very high overall match
+            if (key_similarity >= 0.5 and key_overlap >= 3) or similarity >= 0.8:
+                if similarity > best_score:
+                    best_score = similarity
+                    best_match = data['explanation']
+        
+        return best_match
+    
+    def get_answer(self, question_text):
+        """Get answer from explanations file for a question if available"""
+        normalized_q = self.normalize_text(question_text)
+        
+        # Try exact match first
+        if normalized_q in self.explanations:
+            return self.explanations[normalized_q].get('answer', '').strip().upper()
+        
+        # Try fuzzy matching
+        key_words = normalized_q.split()[:20]
+        key_phrase = ' '.join(key_words)
+        
+        best_match = None
+        best_score = 0
+        
+        for stored_q, data in self.explanations.items():
+            if key_phrase in stored_q or stored_q in normalized_q:
+                stored_words = set(stored_q.split())
+                question_words = set(normalized_q.split())
+                overlap = len(stored_words & question_words)
+                similarity = overlap / max(len(stored_words), len(question_words), 1)
+                
+                if similarity >= 0.6 or overlap >= 8:
+                    if similarity > best_score:
+                        best_score = similarity
+                        best_match = data.get('answer', '').strip().upper()
+        
+        return best_match
+
+class StudyTextIndex:
+    """Index study text for concept lookup"""
+    
+    # Common OCR error corrections
+    OCR_CORRECTIONS = {
+        'los': 'loss',
+        'ocurs': 'occurs',
+        'ocured': 'occurred',
+        'wil': 'will',
+        'prof': 'proof',
+        'diferent': 'different',
+        'alowed': 'allowed',
+        'seeking': 'seeking',
+        'sek': 'seek',
+        'comon': 'common',
+        'efect': 'effect',
+        'vesel': 'vessel',
+        'ben': 'been',
+        'gods': 'goods',
+        'aply': 'apply',
+        'acident': 'accident',
+        'shortfal': 'shortfall',
+        'clasification': 'classification',
+        'remedy': 'remedy',
+        'alowed': 'allowed',
+        'obstacle': 'obstacle',
+        'otherwise': 'otherwise',
+        'principle': 'principle',
+        'available': 'available',
+        'insurer': 'insurer',
+        'required': 'required',
+        'condition': 'condition',
+        'notice': 'notice',
+        'policy': 'policy',
+        'insured': 'insured',
+    }
+    
+    def __init__(self):
+        self.full_texts = {}  # Store full text by file
+        self.question_explanations = QuestionExplanations()  # Load pre-written explanations
+        self.load_study_text()
+    
+    @staticmethod
+    def fix_ocr_errors(text):
+        """Fix common OCR errors in text"""
+        if not text:
+            return text
+        
+        # Fix common OCR errors
+        words = text.split()
+        corrected_words = []
+        
+        for word in words:
+            # Remove trailing punctuation temporarily
+            punct = ''
+            if word and word[-1] in '.,!?;:':
+                punct = word[-1]
+                word_clean = word[:-1]
+            else:
+                word_clean = word
+            
+            # Check for OCR errors (case-insensitive)
+            word_lower = word_clean.lower()
+            if word_lower in StudyTextIndex.OCR_CORRECTIONS:
+                # Preserve original capitalization
+                if word_clean[0].isupper():
+                    corrected = StudyTextIndex.OCR_CORRECTIONS[word_lower].capitalize()
+                else:
+                    corrected = StudyTextIndex.OCR_CORRECTIONS[word_lower]
+                corrected_words.append(corrected + punct)
+            else:
+                corrected_words.append(word)
+        
+        return ' '.join(corrected_words)
+    
+    def load_study_text(self):
+        """Load study text from files"""
+        if not STUDY_TEXT_DIR.exists():
+            STUDY_TEXT_DIR.mkdir()
+            return
+        
+        for file_path in STUDY_TEXT_DIR.iterdir():
+            if file_path.suffix.lower() == '.pdf':
+                text = QuestionParser.extract_text_from_pdf(file_path)
+            elif file_path.suffix.lower() == '.docx':
+                text = QuestionParser.extract_text_from_docx(file_path)
+            elif file_path.suffix.lower() == '.txt':
+                text = file_path.read_text(encoding='utf-8')
+            else:
+                continue
+            
+            self.full_texts[file_path.name] = text
+    
+    def generate_feedback_explanation(self, question_text, correct_answer_text, selected_answer_text, options_text=None, is_correct=False):
+        # First, try to get pre-written explanation
+        pre_written = self.question_explanations.get_explanation(question_text)
+        if pre_written:
+            # Clean up the pre-written explanation
+            explanation = pre_written.strip()
+            # Fix OCR errors
+            explanation = self.fix_ocr_errors(explanation)
+            # Ensure proper formatting
+            explanation = re.sub(r'\s+', ' ', explanation).strip()
+            if explanation and not explanation.endswith(('.', '!', '?')):
+                explanation += '.'
+            
+            if is_correct:
+                return f"Correct! {explanation}"
+            else:
+                return f"The correct answer is {correct_answer_text}. {explanation}"
+        
+        # Fall back to study text search if no pre-written explanation found
+        # Extract key concepts from question and answer
+        # Focus on legal terms and concepts, not common words
+        question_lower = question_text.lower()
+        answer_lower = correct_answer_text.lower()
+        
+        # Extract important legal/concept terms (longer, specific words)
+        important_terms = []
+        # Get terms from question (focus on legal concepts)
+        question_terms = re.findall(r'\b\w{5,}\b', question_lower)
+        important_terms.extend([t for t in question_terms if t not in 
+                                ['which', 'there', 'their', 'would', 'could', 'should', 'about', 'other', 
+                                 'these', 'those', 'court', 'legal', 'law', 'policy', 'cover', 'invalid']])
+        
+        # Get terms from correct answer
+        answer_terms = re.findall(r'\b\w{4,}\b', answer_lower)
+        important_terms.extend([t for t in answer_terms if len(t) > 4])
+        
+        # Remove duplicates
+        important_terms = list(dict.fromkeys(important_terms))[:10]
+        
+        # Find relevant study text sections with better matching
+        relevant_sections = self.find_relevant_text(question_text, options_text)
+        
+        if not relevant_sections:
+            # Fallback explanation if no study text found
+            if is_correct:
+                return f"Correct! {correct_answer_text} is the right answer."
+            else:
+                return f"The correct answer is {correct_answer_text}. You selected {selected_answer_text}."
+        
+        # Look through all relevant sections to find the best explanatory content
+        best_explanation = None
+        best_score = 0
+        
+        for section in relevant_sections:
+            section_text = section['text']
+            section_lower = section_text.lower()
+            
+            # Skip instructional text (like "After you have learnt...", "you may study...")
+            instructional_patterns = [
+                r'after you have',
+                r'you may study',
+                r'you should',
+                r'you will learn',
+                r'this section',
+                r'next section',
+                r'previous section'
+            ]
+            if any(re.search(pattern, section_lower) for pattern in instructional_patterns):
+                continue
+            
+            # Score how well this section explains the concept
+            score = 0
+            
+            # Check for important terms
+            term_matches = sum(1 for term in important_terms if term in section_lower)
+            score += term_matches * 3  # Higher weight for concept matches
+            
+            # Check for explanatory language (defines, means, refers to, etc.)
+            explanatory_words = ['means', 'refers', 'defined', 'definition', 'is when', 'is that', 
+                               'applies', 'applies when', 'occurs', 'requires', 'entitles', 'allows']
+            explanatory_matches = sum(1 for word in explanatory_words if word in section_lower)
+            score += explanatory_matches * 2
+            
+            # Prefer sentences that actually explain (contain "is", "means", "refers", etc.)
+            sentences = re.split(r'[.!?]\s+', section_text)
+            explanatory_sentences = []
+            
+            for sentence in sentences:
+                sentence_lower = sentence.lower()
+                # Skip if it's instructional
+                if any(re.search(pattern, sentence_lower) for pattern in instructional_patterns):
+                    continue
+                
+                # Check if sentence contains important terms
+                term_count = sum(1 for term in important_terms if term in sentence_lower)
+                if term_count > 0:
+                    # Check if it's explanatory
+                    is_explanatory = any(word in sentence_lower for word in explanatory_words) or \
+                                   'is' in sentence_lower or 'are' in sentence_lower
+                    
+                    if is_explanatory and len(sentence.split()) > 8:
+                        explanatory_sentences.append((term_count, sentence.strip()))
+            
+            if explanatory_sentences:
+                # Get best explanatory sentence
+                explanatory_sentences.sort(key=lambda x: x[0], reverse=True)
+                best_sentence = explanatory_sentences[0][1]
+                
+                # Clean and format
+                explanation = best_sentence
+                # Remove random letter/number prefixes (like "B Notice" or "1. ")
+                explanation = re.sub(r'^[A-Z]\s+', '', explanation)  # Remove single letter prefix
+                explanation = re.sub(r'^\d+[\.\)]\s*', '', explanation)  # Remove number prefix
+                # Fix OCR errors
+                explanation = self.fix_ocr_errors(explanation)
+                # Remove double periods and clean up
+                explanation = re.sub(r'\.{2,}', '.', explanation)
+                # Limit to 50 words
+                words = explanation.split()
+                if len(words) > 50:
+                    explanation = ' '.join(words[:50])
+                    # Try to end at sentence boundary
+                    last_period = explanation.rfind('.')
+                    if last_period > len(explanation) * 0.7:
+                        explanation = explanation[:last_period+1]
+                
+                # Skip if explanation is too short or doesn't make sense
+                if len(explanation.split()) >= 8 and not re.match(r'^[A-Z]\s', explanation):
+                    if score > best_score:
+                        best_score = score
+                        best_explanation = explanation
+        
+        # If we found a good explanation, use it
+        if best_explanation:
+            core_explanation = best_explanation
+        else:
+            # Fallback: try to extract from best section, avoiding instructional text
+            best_section = relevant_sections[0]['text']
+            sentences = re.split(r'[.!?]\s+', best_section)
+            
+            # Find first non-instructional sentence with important terms
+            for sentence in sentences:
+                sentence_lower = sentence.lower()
+                if any(re.search(pattern, sentence_lower) for pattern in instructional_patterns):
+                    continue
+                
+                term_count = sum(1 for term in important_terms if term in sentence_lower)
+                if term_count > 0 and len(sentence.split()) > 8:
+                    words = sentence.split()
+                    core_explanation = ' '.join(words[:40])
+                    # Fix OCR errors
+                    core_explanation = self.fix_ocr_errors(core_explanation)
+                    if not core_explanation.endswith(('.', '!', '?')):
+                        core_explanation += '.'
+                    break
+            else:
+                # Last resort: simple explanation
+                core_explanation = f"This relates to {correct_answer_text.lower()}."
+        
+        # Clean up formatting issues
+        # Remove bullet points and list markers (•, -, *, etc.)
+        core_explanation = re.sub(r'[•\-\*]\s*', '', core_explanation)
+        # Remove numbered list markers at start of line
+        core_explanation = re.sub(r'^\d+[\.\)]\s*', '', core_explanation, flags=re.MULTILINE)
+        # Remove any remaining list-style formatting
+        core_explanation = re.sub(r'^\s*[•\-\*]\s*', '', core_explanation, flags=re.MULTILINE)
+        # Remove single letter prefixes (like "B Notice")
+        core_explanation = re.sub(r'^[A-Z]\s+', '', core_explanation)
+        # Remove instructional phrases that might have slipped through
+        core_explanation = re.sub(r'\b(after you have|you may study|you should|you will learn)\b[^.]*\.?\s*', '', core_explanation, flags=re.IGNORECASE)
+        # Remove extra whitespace and normalize
+        core_explanation = re.sub(r'\s+', ' ', core_explanation).strip()
+        # Remove double periods
+        core_explanation = re.sub(r'\.{2,}', '.', core_explanation)
+        # Remove any leading/trailing punctuation issues
+        core_explanation = re.sub(r'^[,\s;:]+', '', core_explanation)
+        core_explanation = re.sub(r'[,;:]+$', '', core_explanation)
+        
+        # Fix OCR errors (spelling mistakes)
+        core_explanation = self.fix_ocr_errors(core_explanation)
+        
+        # Ensure it starts with a capital letter
+        if core_explanation and len(core_explanation) > 0:
+            if core_explanation[0].islower():
+                core_explanation = core_explanation[0].upper() + core_explanation[1:]
+        # Ensure proper sentence ending
+        core_explanation = core_explanation.rstrip()
+        if core_explanation and not core_explanation.endswith(('.', '!', '?')):
+            core_explanation += '.'
+        # Final cleanup of any double spaces
+        core_explanation = re.sub(r'\s+', ' ', core_explanation).strip()
+        
+        # Generate targeted feedback with proper formatting
+        if is_correct:
+            return f"Correct! {core_explanation}"
+        else:
+            return f"The correct answer is {correct_answer_text}. {core_explanation}"
+    
+    def find_relevant_text(self, question_text, options_text=None):
+        """Find relevant study text sections for a question - returns concise, relevant excerpts (max 50 words)"""
+        # Extract meaningful keywords from question
+        # Focus on legal terms, concepts, and important nouns
+        question_lower = question_text.lower()
+        
+        # Extract key legal terms and concepts (longer words, proper nouns, etc.)
+        # Look for legal terms, act names, concepts
+        keywords = []
+        
+        # Extract words that are likely legal terms (5+ chars, not common words)
+        common_words = {'which', 'there', 'their', 'would', 'could', 'should', 'about', 'other', 
+                        'these', 'those', 'court', 'legal', 'law', 'act', 'may', 'can', 'must'}
+        
+        # Get meaningful words from question
+        question_words = re.findall(r'\b\w{4,}\b', question_lower)
+        keywords.extend([w for w in question_words if w not in common_words and len(w) > 3])
+        
+        # Also extract from options if provided
+        if options_text:
+            for opt in options_text:
+                opt_words = re.findall(r'\b\w{4,}\b', opt.lower())
+                keywords.extend([w for w in opt_words if w not in common_words and len(w) > 3])
+        
+        # Remove duplicates and keep top keywords
+        keywords = list(dict.fromkeys(keywords))[:8]  # Top 8 unique keywords
+        
+        if not keywords:
+            return []
+        
+        relevant_sections = []
+        
+        for file_name, full_text in self.full_texts.items():
+            # Split into paragraphs (double newlines or sentence breaks)
+            paragraphs = re.split(r'\n\s*\n|\.\s+(?=[A-Z])', full_text)
+            
+            scored_paragraphs = []
+            
+            for para in paragraphs:
+                # Skip very short paragraphs
+                para_clean = para.strip()
+                if len(para_clean) < 30:
+                    continue
+                
+                # Skip paragraphs that are mostly reference lists
+                # Check for patterns like "Act 1906, 5C5" or lots of codes/references
+                code_patterns = len(re.findall(r'\d{4}[A-Z]?\d+[A-Z]?', para_clean))
+                reference_patterns = len(re.findall(r'[A-Z]\d+[A-Z]?\d*', para_clean))
+                
+                # If there are many codes/references relative to text length, skip it
+                words_in_para = len(para_clean.split())
+                if words_in_para > 0:
+                    code_density = (code_patterns + reference_patterns) / words_in_para
+                    if code_density > 0.15:  # More than 15% codes/references
+                        continue
+                
+                # Skip if it starts with a reference pattern
+                if re.match(r'^[A-Z][a-z]+\s+\d{4}', para_clean):
+                    # Check if it's mostly a list (many commas, few sentences)
+                    commas = para_clean.count(',')
+                    periods = para_clean.count('.')
+                    if commas > periods * 2 and commas > 5:
+                        continue
+                
+                # Skip table of contents style content
+                if re.match(r'^(Chapter|Section|Page|\d+\.)', para_clean, re.IGNORECASE):
+                    continue
+                
+                # Skip paragraphs that are mostly numbers/codes
+                words = para_clean.split()
+                if len(words) > 0:
+                    non_word_chars = sum(1 for w in words if not re.search(r'[a-zA-Z]{3,}', w))
+                    if non_word_chars / len(words) > 0.4:  # More than 40% non-words
+                        continue
+                
+                para_lower = para_clean.lower()
+                
+                # Score paragraph by keyword matches
+                score = 0
+                matched_keywords = []
+                for keyword in keywords:
+                    if keyword in para_lower:
+                        score += 2  # Higher weight for keyword matches
+                        matched_keywords.append(keyword)
+                
+                # Bonus for multiple keyword matches
+                if len(matched_keywords) >= 2:
+                    score += len(matched_keywords)
+                
+                if score > 0:
+                    # Limit paragraph to reasonable length and clean it
+                    words = para_clean.split()
+                    if len(words) > 100:
+                        # Take a relevant chunk (try to find where keywords appear)
+                        best_start = 0
+                        best_score = 0
+                        for i in range(len(words) - 50):
+                            chunk = ' '.join(words[i:i+60])
+                            chunk_score = sum(1 for kw in keywords if kw in chunk.lower())
+                            if chunk_score > best_score:
+                                best_score = chunk_score
+                                best_start = i
+                        para_clean = ' '.join(words[best_start:best_start+60])
+                    
+                    # Strictly limit to 50 words max
+                    words = para_clean.split()
+                    if len(words) > 50:
+                        # Take first 50 words
+                        para_clean = ' '.join(words[:50])
+                        # Try to end at a sentence boundary if possible
+                        last_period = para_clean.rfind('.')
+                        last_excl = para_clean.rfind('!')
+                        last_quest = para_clean.rfind('?')
+                        last_punct = max(last_period, last_excl, last_quest)
+                        # If we find punctuation in the last 40% of text, use it
+                        if last_punct > len(para_clean) * 0.6:
+                            para_clean = para_clean[:last_punct+1].strip()
+                        else:
+                            # Otherwise just ensure it doesn't end mid-word
+                            para_clean = para_clean.rstrip()
+                            if not para_clean.endswith(('.', '!', '?', ';', ':')):
+                                para_clean += '.'
+                    
+                    # Clean up extra whitespace and formatting issues
+                    para_clean = re.sub(r'\s+', ' ', para_clean).strip()
+                    # Remove bullet points and list markers
+                    para_clean = re.sub(r'[•\-\*]\s*', '', para_clean)
+                    # Remove duplicate words/phrases (like "Chapter 1Chapter 1")
+                    para_clean = re.sub(r'(\w+)\1+', r'\1', para_clean)
+                    # Remove page numbers and formatting artifacts
+                    para_clean = re.sub(r'\d+/\d+', '', para_clean)  # Remove page numbers like "1/15"
+                    para_clean = re.sub(r'Chapter \d+Chapter \d+', 'Chapter', para_clean)
+                    # Remove list markers at start of sentences
+                    para_clean = re.sub(r'^\d+[\.\)]\s*', '', para_clean, flags=re.MULTILINE)
+                    # Fix OCR errors
+                    para_clean = StudyTextIndex.fix_ocr_errors(para_clean)
+                    para_clean = re.sub(r'\s+', ' ', para_clean).strip()
+                    
+                    # Final word count check
+                    words = para_clean.split()
+                    if len(words) > 50:
+                        para_clean = ' '.join(words[:50]).rstrip()
+                        if not para_clean.endswith(('.', '!', '?', ';', ':')):
+                            para_clean += '.'
+                    elif len(words) < 10:
+                        # Skip if too short after cleaning
+                        continue
+                    
+                    scored_paragraphs.append({
+                        'score': score,
+                        'text': para_clean.strip(),
+                        'matched_keywords': matched_keywords
+                    })
+            
+            # Sort by score and get best match
+            scored_paragraphs.sort(key=lambda x: x['score'], reverse=True)
+            
+            # Get top 1-2 most relevant sections
+            for section in scored_paragraphs[:2]:
+                if len(section['text'].split()) >= 10:  # At least 10 words
+                    relevant_sections.append({
+                        'file': file_name,
+                        'text': section['text'],
+                        'relevance_score': section['score']
+                    })
+                    if len(relevant_sections) >= 2:  # Max 2 sections
+                        break
+        
+        # Sort by relevance score
+        relevant_sections.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+        return relevant_sections[:2]  # Return top 2 most relevant
+
+# Initialize
+study_index = StudyTextIndex()
+
+def load_questions():
+    """Load questions from file or parse from papers"""
+    if QUESTIONS_FILE.exists():
+        with open(QUESTIONS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    else:
+        questions = QuestionParser.load_questions_from_files()
+        save_questions(questions)
+        return questions
+
+def save_questions(questions):
+    """Save questions to file"""
+    with open(QUESTIONS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(questions, f, indent=2, ensure_ascii=False)
+
+def login_required(f):
+    """Decorator to require login for routes"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'logged_in' not in session or not session['logged_in']:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Login page"""
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        # Check credentials
+        if username == DEFAULT_USERNAME and check_password_hash(DEFAULT_PASSWORD_HASH, password):
+            session['logged_in'] = True
+            session['username'] = username
+            return redirect(url_for('index'))
+        else:
+            return render_template('login.html', error='Invalid username or password')
+    
+    # If already logged in, redirect to home
+    if session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    """Logout and clear session"""
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route('/')
+@login_required
+def index():
+    return render_template('selection.html')
+
+@app.route('/quiz')
+def quiz():
+    return render_template('quiz.html')
+
+@app.route('/results')
+def results():
+    return render_template('results.html')
+
+@app.route('/history')
+def history():
+    return render_template('history.html')
+
+@app.route('/api/check-auth')
+def check_auth():
+    """Check if user is authenticated"""
+    return jsonify({'authenticated': session.get('logged_in', False)})
+
+@app.route('/api/questions')
+@login_required
+def get_questions():
+    """Get all questions"""
+    questions = load_questions()
+    return jsonify(questions)
+
+@app.route('/api/questions/filter', methods=['POST'])
+@login_required
+def get_filtered_questions():
+    """Get filtered questions by count, year, or learning objective"""
+    data = request.json
+    count = data.get('count')
+    year = data.get('year')
+    learning_objective = data.get('learning_objective')
+    multiple_choice_only = data.get('multiple_choice_only', False)
+    
+    all_questions = load_questions()
+    
+    # Filter by multiple choice only if specified
+    if multiple_choice_only:
+        filtered = [q for q in all_questions if q.get('is_multiple_choice', False)]
+        # Shuffle for variety
+        import random
+        random.shuffle(filtered)
+        # Limit by count if specified
+        if count:
+            filtered = filtered[:int(count)]
+    # Filter by learning objective if specified
+    elif learning_objective:
+        filtered = [q for q in all_questions if q.get('learning_objective') == str(learning_objective)]
+        # Shuffle for variety
+        import random
+        random.shuffle(filtered)
+        # Limit to 20 or all if less than 20
+        if len(filtered) > 20:
+            filtered = filtered[:20]
+    # Filter by year if specified
+    elif year:
+        # Filter questions from the specified year
+        filtered = [q for q in all_questions if str(year) in q.get('source_file', '')]
+        # Sort by original question number to maintain PDF order
+        def get_sort_key(q):
+            if 'original_order' in q:
+                return q['original_order']
+            q_num = q.get('question_number', '')
+            try:
+                return int(q_num) if q_num.isdigit() else 999999
+            except:
+                return 999999
+        filtered.sort(key=get_sort_key)
+    else:
+        filtered = all_questions
+        # Only shuffle if it's a count-based selection (not a year)
+        if count:
+            import random
+            random.shuffle(filtered)
+    
+    # Limit by count if specified (only for count-based selections, not learning objective)
+    if count and not year and not learning_objective:
+        filtered = filtered[:int(count)]
+    
+    return jsonify(filtered)
+
+@app.route('/api/years')
+@login_required
+def get_available_years():
+    """Get list of available exam years"""
+    questions = load_questions()
+    years = set()
+    for q in questions:
+        source = q.get('source_file', '')
+        # Extract year from filename like "M05 Exam - 2024.pdf"
+        year_match = re.search(r'(\d{4})', source)
+        if year_match:
+            years.add(year_match.group(1))
+    return jsonify(sorted(list(years), reverse=True))
+
+@app.route('/api/learning-objectives')
+@login_required
+def get_learning_objectives():
+    """Get list of available learning objectives with question counts"""
+    questions = load_questions()
+    objectives = {}
+    for q in questions:
+        lo = q.get('learning_objective')
+        if lo:
+            if lo not in objectives:
+                objectives[lo] = 0
+            objectives[lo] += 1
+    # Return sorted by objective number
+    return jsonify(sorted([{'number': k, 'count': v} for k, v in objectives.items()], 
+                          key=lambda x: float(x['number'])))
+
+@app.route('/api/multiple-choice-count')
+@login_required
+def get_multiple_choice_count():
+    """Get count of multiple choice questions available"""
+    questions = load_questions()
+    multiple_choice_count = sum(1 for q in questions if q.get('is_multiple_choice', False))
+    return jsonify({'count': multiple_choice_count})
+
+@app.route('/api/results', methods=['POST'])
+@login_required
+def save_results():
+    """Save quiz results to history"""
+    data = request.json
+    results_file = Path("results_history.json")
+    
+    # Load existing results
+    if results_file.exists():
+        with open(results_file, 'r', encoding='utf-8') as f:
+            results_history = json.load(f)
+    else:
+        results_history = []
+    
+    # Add timestamp and save
+    result_entry = {
+        'id': len(results_history) + 1,
+        'timestamp': data.get('timestamp', ''),
+        'total': data.get('total', 0),
+        'correct': data.get('correct', 0),
+        'incorrect': data.get('incorrect', 0),
+        'percentage': data.get('percentage', 0),
+        'mode': data.get('mode', ''),
+        'learning_objective_breakdown': data.get('learning_objective_breakdown', {}),
+        'questions': data.get('questions', []),
+        'answers': data.get('answers', [])
+    }
+    
+    results_history.append(result_entry)
+    
+    with open(results_file, 'w', encoding='utf-8') as f:
+        json.dump(results_history, f, indent=2, ensure_ascii=False)
+    
+    return jsonify({'success': True, 'message': 'Results saved'})
+
+@app.route('/api/results/history')
+@login_required
+def get_results_history():
+    """Get all quiz results history"""
+    results_file = Path("results_history.json")
+    if results_file.exists():
+        with open(results_file, 'r', encoding='utf-8') as f:
+            return jsonify(json.load(f))
+    return jsonify([])
+
+@app.route('/api/question/<int:question_id>')
+@login_required
+def get_question(question_id):
+    """Get a specific question with study text references"""
+    questions = load_questions()
+    question = next((q for q in questions if q['id'] == question_id), None)
+    
+    if question:
+        # Find relevant study text
+        relevant_text = study_index.find_relevant_text(question['question'])
+        question['study_text'] = relevant_text
+    
+    return jsonify(question)
+
+@app.route('/api/submit-answer', methods=['POST'])
+@login_required
+def submit_answer():
+    """Submit an answer and get feedback"""
+    data = request.json
+    question_id = data.get('question_id')
+    selected_answer = data.get('answer')
+    
+    questions = load_questions()
+    question = next((q for q in questions if q['id'] == question_id), None)
+    
+    if not question:
+        return jsonify({'error': 'Question not found'}), 404
+    
+    # Handle multiple answer questions
+    correct_answers = [a.strip().upper() for a in question['correct_answer'].split(',')]
+    selected_answers = [a.strip().upper() for a in selected_answer.split(',')]
+    
+    # Check if correct (all selected answers are correct and all correct answers are selected)
+    is_correct = (set(selected_answers) == set(correct_answers)) and len(selected_answers) == len(correct_answers)
+    
+    # Get correct option text(s) for feedback
+    correct_options = [opt for opt in question['options'] if opt['letter'] in correct_answers]
+    selected_options = [opt for opt in question['options'] if opt['letter'] in selected_answers]
+    
+    # Validate that we found the options
+    if not correct_options:
+        return jsonify({'error': f'Correct answer(s) {question["correct_answer"]} not found in options for question {question_id}'}), 400
+    if not selected_options:
+        return jsonify({'error': f'Selected answer(s) {selected_answer} not found in options for question {question_id}'}), 400
+    
+    # For single answer, use first option; for multiple, combine them
+    correct_option = correct_options[0] if len(correct_options) == 1 else None
+    correct_option_text = correct_option['text'] if correct_option else ', '.join([opt['text'] for opt in correct_options])
+    selected_option = selected_options[0] if len(selected_options) == 1 else None
+    selected_option_text = selected_option['text'] if selected_option else ', '.join([opt['text'] for opt in selected_options])
+    
+    # Generate concise feedback explanation from study text
+    options_text = [opt['text'] for opt in question['options']]
+    feedback_explanation = study_index.generate_feedback_explanation(
+        question['question'],
+        correct_option_text,
+        selected_option_text,
+        options_text,
+        is_correct
+    )
+    
+    feedback = {
+        'is_correct': is_correct,
+        'correct_answer': question['correct_answer'],
+        'correct_option_text': correct_option_text,
+        'is_multiple_choice': question.get('is_multiple_choice', False),
+        'selected_option_text': selected_option_text,
+        'explanation': feedback_explanation,
+        'learning_objective': question.get('learning_objective', ''),
+        'feedback_points': []
+    }
+    
+    return jsonify(feedback)
+
+@app.route('/api/reload-questions', methods=['POST'])
+@login_required
+def reload_questions():
+    """Reload questions from exam papers"""
+    questions = QuestionParser.load_questions_from_files()
+    save_questions(questions)
+    study_index.load_study_text()  # Reload study text too
+    return jsonify({'message': f'Loaded {len(questions)} questions', 'count': len(questions)})
+
+@app.route('/api/submit-results', methods=['POST'])
+@login_required
+def submit_results():
+    """Save quiz results"""
+    data = request.json
+    # Store results (could save to file/database)
+    return jsonify({'success': True, 'message': 'Results saved'})
+
+if __name__ == '__main__':
+    # Create directories if they don't exist
+    EXAM_PAPERS_DIR.mkdir(exist_ok=True)
+    STUDY_TEXT_DIR.mkdir(exist_ok=True)
+    
+    # Allow port to be set via environment variable (for hosting platforms)
+    port = int(os.environ.get('PORT', 5001))
+    # In production, set debug=False and host='0.0.0.0'
+    debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
+

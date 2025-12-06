@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>M05 Exam Question Practice - Select Quiz</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>M05 Exam Question Practice</h1>
+            <div class="header-actions">
+                <a href="/history" class="btn-secondary">Practice History</a>
+                <a href="/logout" class="btn-secondary">Logout</a>
+            </div>
+        </header>
+
+        <div class="selection-content">
+            <div class="selection-card">
+                <h2>Select Quiz Mode</h2>
+                
+                <div class="selection-section">
+                    <h3>Practice by Number of Questions</h3>
+                    <div class="button-group">
+                        <button class="quiz-btn" data-mode="count" data-value="10">10 Questions</button>
+                        <button class="quiz-btn" data-mode="count" data-value="20">20 Questions</button>
+                        <button class="quiz-btn" data-mode="count" data-value="50">50 Questions</button>
+                        <button class="quiz-btn" data-mode="count" data-value="100">100 Questions</button>
+                    </div>
+                </div>
+
+                <div class="divider">OR</div>
+
+                <div class="selection-section">
+                    <h3>Practice by Past Paper Year</h3>
+                    <div class="button-group" id="yearButtons">
+                        <div class="loading-years">Loading years...</div>
+                    </div>
+                </div>
+
+                <div class="divider">OR</div>
+
+                <div class="selection-section">
+                    <h3>Practice by Learning Objective</h3>
+                    <div class="button-group" id="learningObjectiveButtons">
+                        <div class="loading-years">Loading learning objectives...</div>
+                    </div>
+                </div>
+
+                <div class="divider">OR</div>
+
+                <div class="selection-section">
+                    <h3>Practice Multiple Selection Questions</h3>
+                    <div class="button-group">
+                        <button class="quiz-btn" data-mode="multiple" data-value="all">All Multiple Selection Questions</button>
+                        <button class="quiz-btn" data-mode="multiple" data-value="10">10 Multiple Selection Questions</button>
+                        <button class="quiz-btn" data-mode="multiple" data-value="20">20 Multiple Selection Questions</button>
+                        <button class="quiz-btn" data-mode="multiple" data-value="50">50 Multiple Selection Questions</button>
+                    </div>
+                </div>
+
+                <div id="selectionConfirmation" class="selection-confirmation hidden">
+                    <div class="confirmation-content">
+                        <h3>Selected Quiz Mode</h3>
+                        <div id="selectedInfo" class="selected-info"></div>
+                        <div class="confirmation-actions">
+                            <button id="startQuizBtn" class="btn-primary">Start Quiz</button>
+                            <button id="changeSelectionBtn" class="btn-secondary">Change Selection</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="info-section">
+                    <p>Questions are randomly selected from all available exam papers.</p>
+                    <button id="reloadBtn" class="btn-secondary">Reload Questions from PDFs</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='selection.js') }}"></script>
+</body>
+</html>
+
