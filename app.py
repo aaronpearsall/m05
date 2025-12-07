@@ -66,28 +66,49 @@ class QuestionParser:
         
         # Pattern to match questions starting with numbers (1., 2., etc.)
         # Format: "1. Question text\nA. Option A\nB. Option B\nC. Option C\nD. Option D"
-        # Split text by question numbers
-        question_blocks = re.split(r'(?=\n\d+[\.\)]\s)', text)
+        # Only match question numbers at the start of a line (after newline or start of text)
+        # This prevents matching numbers in the middle of text (e.g., "E05" or "contracts. 9")
+        question_blocks = re.split(r'(?=^(?:\d+[\.\)]\s)|(?<=\n)(?:\d+[\.\)]\s))', text, flags=re.MULTILINE)
         
         for block in question_blocks:
-            # Match question number and content
-            match = re.match(r'(\d+)[\.\)]\s*(.+?)(?=\n\d+[\.\)]|$)', block.strip(), re.DOTALL)
+            # Match question number and content - must start at beginning of block
+            # Stop at the next question number (more specific pattern to prevent over-matching)
+            match = re.match(r'^(\d+)[\.\)]\s*(.+?)(?=\n\d+[\.\)]\s|$)', block.strip(), re.DOTALL)
             if not match:
                 continue
                 
             question_num = match.group(1)
             question_content = match.group(2).strip()
             
+            # Skip if this doesn't look like a real question (no options found)
+            # Real questions should have at least one option (A., B., etc.)
+            if not re.search(r'\n[A-E][\.\)]\s', question_content, re.IGNORECASE):
+                continue
+            
+            # IMPORTANT: Stop extracting content when we hit the next question number
+            # This prevents one question from capturing the next question's options
+            # Find where the next question starts and truncate if found
+            next_question_match = re.search(r'\n(\d+)[\.\)]\s', question_content)
+            if next_question_match:
+                # Truncate at the next question
+                question_content = question_content[:next_question_match.start()].strip()
+            
             # Extract options - look for lines starting with A., B., C., D., E.
-            # Options may span multiple lines, so we need to capture until the next option or question
+            # CRITICAL: Stop if we encounter a new question number (prevents merging questions)
             options = []
             lines = question_content.split('\n')
             current_option = None
             
-            for line in lines:
+            for i, line in enumerate(lines):
                 line = line.strip()
                 if not line:
                     continue
+                
+                # CRITICAL CHECK: If we see a new question number, STOP immediately
+                # This prevents one question from capturing the next question's options
+                if re.match(r'^\d+[\.\)]\s', line):
+                    # This is a new question - stop processing
+                    break
                 
                 # Check if this line starts a new option
                 option_match = re.match(r'^([A-E])[\.\)]\s*(.+)$', line, re.IGNORECASE)
@@ -128,15 +149,18 @@ class QuestionParser:
                 opt['text'] = re.sub(r'\s*Examination\s+Guide.*?$', '', opt['text'], flags=re.IGNORECASE)
                 opt['text'] = re.sub(r'\s*\d{4}/\d{4}\s+\d+.*?$', '', opt['text'])  # Remove "2025/2026 13" patterns
                 opt['text'] = re.sub(r'\s*Page\s+\d+.*?$', '', opt['text'], flags=re.IGNORECASE)
-                # Remove trailing standalone numbers that are likely page numbers
-                opt['text'] = re.sub(r'\s+\d{1,3}\s*$', '', opt['text'])  # Remove trailing numbers (1-3 digits)
+                # Remove trailing standalone numbers that are likely page numbers (but preserve if part of sentence)
+                # Only remove if it's a standalone number at the end (not part of text like "2021" in a sentence)
+                opt['text'] = re.sub(r'\s+\d{1,2}\s*$', '', opt['text'])  # Remove trailing 1-2 digit numbers (likely page refs)
                 # Remove common footer/header patterns
                 opt['text'] = re.sub(r'^\d+/\d+\s*', '', opt['text'])  # Remove page numbers like "1/15"
                 # Remove any remaining "Examination Guide" text
                 opt['text'] = re.sub(r'\s*Examination\s+Guide.*', '', opt['text'], flags=re.IGNORECASE)
                 opt['text'] = re.sub(r'\s+', ' ', opt['text']).strip()
-                # Remove trailing punctuation that might be artifacts
-                opt['text'] = re.sub(r'[\.\s]+$', '', opt['text']).strip()
+                # Preserve trailing periods if they're part of the option text (don't remove them)
+                # Only remove if it's clearly an artifact (multiple periods or periods with spaces)
+                opt['text'] = re.sub(r'\.{2,}', '.', opt['text'])  # Replace multiple periods with single
+                opt['text'] = re.sub(r'\s+\.\s*$', '.', opt['text'])  # Fix "text ." to "text."
             
             # Extract question text (everything before the first option)
             clean_question = question_content
@@ -1083,15 +1107,15 @@ def get_filtered_questions():
     elif year:
         # Filter questions from the specified year
         filtered = [q for q in all_questions if str(year) in q.get('source_file', '')]
-        # Sort by original question number to maintain PDF order
+        # Sort by question number to maintain exact PDF order (1, 2, 3, ..., 50)
         def get_sort_key(q):
-            if 'original_order' in q:
-                return q['original_order']
             q_num = q.get('question_number', '')
             try:
+                # Use question_number directly for exact numerical order
                 return int(q_num) if q_num.isdigit() else 999999
             except:
-                return 999999
+                # Fallback to original_order if question_number is invalid
+                return q.get('original_order', 999999)
         filtered.sort(key=get_sort_key)
     else:
         filtered = all_questions
