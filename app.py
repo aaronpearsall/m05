@@ -61,13 +61,14 @@ class QuestionParser:
     
     @staticmethod
     def parse_questions(text):
-        """Parse multiple choice questions from text"""
+        """Parse multiple choice questions from text (works for both PDF and text files)"""
         questions = []
         
         # Pattern to match questions starting with numbers (1., 2., etc.)
         # Format: "1. Question text\nA. Option A\nB. Option B\nC. Option C\nD. Option D"
         # Only match question numbers at the start of a line (after newline or start of text)
         # This prevents matching numbers in the middle of text (e.g., "E05" or "contracts. 9")
+        # For text files, this is more reliable since there are no page breaks/headers
         question_blocks = re.split(r'(?=^(?:\d+[\.\)]\s)|(?<=\n)(?:\d+[\.\)]\s))', text, flags=re.MULTILINE)
         
         for block in question_blocks:

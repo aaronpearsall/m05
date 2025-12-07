@@ -5,6 +5,8 @@ This app helps you practice multiple choice questions from insurance law exam pa
 ## Setup
 
 1. **Upload Exam Papers**: Place your exam papers (PDF or text files) in the `exam_papers/` directory
+   - **Recommended: Use `.txt` files** for more reliable parsing (see `EXAM_PAPER_TEXT_FORMAT.md` for format guide)
+   - PDFs are supported but may have parsing issues with page breaks and formatting
 2. **Upload Study Text**: Place your study text materials (PDF or text files) in the `study_text/` directory
 3. **Upload Question Explanations** (Optional): Place a text file with "explanation", "answer", or "concept" in the filename in the `study_text/` directory. The app will use these pre-written explanations instead of searching the study text. See `study_text/EXPLANATIONS_FORMAT.txt` for format examples.
 4. **Install Dependencies**: Run `pip install -r requirements.txt`
