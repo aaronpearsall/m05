@@ -998,13 +998,11 @@ study_index = StudyTextIndex()
 
 def load_questions():
     """Load questions from file or parse from papers"""
-    if QUESTIONS_FILE.exists():
-        with open(QUESTIONS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    else:
-        questions = QuestionParser.load_questions_from_files()
-        save_questions(questions)
-        return questions
+    # Always regenerate from source files to ensure we have the latest data
+    # This ensures Railway and local environments stay in sync
+    questions = QuestionParser.load_questions_from_files()
+    save_questions(questions)
+    return questions
 
 def save_questions(questions):
     """Save questions to file"""
